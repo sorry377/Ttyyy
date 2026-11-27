@@ -69,13 +69,23 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install SDK platform and build-tools
+      - name: Prepare Android SDK (preinstalled on runner)
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" || true
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then
+            SDKM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          fi
+          echo "SDK: $SDK"
+          echo "sdkmanager: ${SDKM:-not found}"
+
+          if [ -n "$SDKM" ]; then
+            yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+            "$SDKM" --install "platforms;android-34" "build-tools;34.0.0" || true
+          fi
 
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
