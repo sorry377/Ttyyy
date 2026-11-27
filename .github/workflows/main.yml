@@ -1,0 +1,128 @@
+name: Build APK from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**.zip'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP and find project root
+        id: prep
+        run: |
+          set -euo pipefail
+
+          # 1) หา zip ที่มีโปรเจกต์ Gradle อยู่ข้างใน
+          ZIP=""
+          while IFS= read -r z; do
+            if unzip -Z1 "$z" 2>/dev/null | grep -qE '(^|/)settings\.gradle(\.kts)?$'; then
+              ZIP="$z"
+              break
+            fi
+          done < <(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './work/*' | sort)
+
+          rm -rf work
+          mkdir -p work
+
+          if [ -n "$ZIP" ]; then
+            echo "Using zip: $ZIP"
+            unzip -q -o "$ZIP" -d work
+            SEARCH_DIR=work
+          else
+            echo "No project zip found -> using repository files"
+            SEARCH_DIR=.
+          fi
+
+          # 2) หาโฟลเดอร์ root ของโปรเจกต์ (ที่มี settings.gradle) เอาตัวที่ตื้นที่สุด
+          SETTINGS="$(find "$SEARCH_DIR" -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+            -not -path '*/__MACOSX/*' -not -path './.git/*' \
+            | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n 1 | cut -d' ' -f2-)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::ไม่พบ settings.gradle(.kts) ทั้งใน zip และใน repo - ตรวจว่า zip มีโปรเจกต์ Android อยู่จริง"
+            exit 1
+          fi
+
+          ROOT="$(dirname "$SETTINGS")"
+          echo "Project root: $ROOT"
+          ls -la "$ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform and build-tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" || true
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Gradle wrapper
+        working-directory: ${{ steps.prep.outputs.root }}
+        run: |
+          set -eu
+          if [ ! -f gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradlew / wrapper jar missing -> generating wrapper"
+            gradle wrapper --gradle-version 8.5
+          fi
+          # กันปัญหา zip ที่สร้างบน Windows (CRLF) และไฟล์ไม่มีสิทธิ์ execute
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build debug APK
+        working-directory: ${{ steps.prep.outputs.root }}
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          set -eu
+          mkdir -p out
+          find "${{ steps.prep.outputs.root }}" -type f -name '*.apk' -path '*build/outputs/apk/*' -exec cp -v {} out/ \;
+          ls -la out/
+          if ! ls out/*.apk > /dev/null 2>&1; then
+            echo "::error::ไม่พบไฟล์ .apk หลัง build"
+            exit 1
+          fi
+
+      - name: Upload APK (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorldBoxModLoader-APK
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK to Releases (direct download)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/*.apk \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "APK build #${{ github.run_number }}" \
+            --notes "Debug APK built from zip (run #${{ github.run_number }})"
